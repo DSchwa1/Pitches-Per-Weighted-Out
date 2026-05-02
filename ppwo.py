@@ -12,7 +12,7 @@ denominator — they improve your score without breaking the math.
 import pandas as pd
 import numpy as np
 import pybaseball
-from pybaseball import statcast
+from pybaseball import statcast, playerid_reverse_lookup
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -224,9 +224,10 @@ print(f"\nPA-ending pitches (events not null): {len(pa_df):,}")
 
 team_col, pa_df = resolve_team_col(pa_df)
 
+# Note: Statcast `player_name` is the PITCHER's name, not the batter's.
+# Batter names are looked up separately in Step 8 via playerid_reverse_lookup.
 pa_df = pa_df.rename(columns={
     "batter":       "batter_id",
-    "player_name":  "batter_name",
     team_col:       "team",
     "pitch_number": "pitch_num_in_pa",
 })
@@ -284,25 +285,41 @@ else:
     print("\n  Data quality check passed — all event types mapped.")
 
 # ── Step 8: Aggregate by batter ──────────────────────────────────
-if "batter_name" not in pa_df.columns or pa_df["batter_name"].isna().all():
-    print("\nNote: player_name missing — using batter_id as name.")
-    pa_df["batter_name"] = pa_df["batter_id"].astype(str)
-
-latest_team = (
-    pa_df.sort_values("game_date")
-    .groupby("batter_id")["team"]
-    .last()
-    .reset_index()
-)
-
-agg = pa_df.groupby(["batter_id", "batter_name"]).agg(
+# Group by batter_id only — player_name in Statcast is the pitcher, not the batter.
+agg = pa_df.groupby("batter_id").agg(
     total_pitches = ("pitches_in_pa", "sum"),
     total_wo      = ("weighted_outs", "sum"),
     total_pa      = ("game_pk",       "count"),
     total_gidp    = ("is_gidp",       "sum"),
 ).reset_index()
 
-agg = agg.merge(latest_team, on="batter_id", how="left")
+# Look up batter names from MLBAM IDs
+print("Looking up batter names...")
+try:
+    name_lookup = playerid_reverse_lookup(agg["batter_id"].tolist(), key_type="mlbam")
+    name_lookup["batter_name"] = (
+        name_lookup["name_first"].str.capitalize() + " " +
+        name_lookup["name_last"].str.capitalize()
+    )
+    name_lookup = name_lookup[["key_mlbam", "batter_name"]].rename(
+        columns={"key_mlbam": "batter_id"}
+    )
+    agg = agg.merge(name_lookup, on="batter_id", how="left")
+except Exception as e:
+    print(f"Name lookup failed ({e}) — using batter IDs as names.")
+    agg["batter_name"] = agg["batter_id"].astype(str)
+
+agg["batter_name"] = agg["batter_name"].fillna(agg["batter_id"].astype(str))
+
+# Attach most-recent team via map (avoids merge column conflicts)
+team_map = (
+    pa_df.sort_values("game_date")
+    .drop_duplicates("batter_id", keep="last")
+    .set_index("batter_id")["team"]
+)
+agg["team"] = agg["batter_id"].map(team_map).fillna("UNK")
+
+print(f"  {len(agg)} batters aggregated, {(agg['total_pa'] >= MIN_PA).sum()} qualify (>={MIN_PA} PA)")
 agg["p_per_pa"]         = agg["total_pitches"] / agg["total_pa"]
 agg["avg_pitches_per_pa"] = agg["total_pitches"] / agg["total_pa"]
 agg["ppwo"] = np.where(
