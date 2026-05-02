@@ -1,0 +1,4 @@
+ppwo_leaderboard_*.csv
+pybaseball_cache/
+__pycache__/
+*.pyc
